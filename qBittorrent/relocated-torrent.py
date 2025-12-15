@@ -1,21 +1,20 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-qb_restore_clean.py
+qb_restore_setlocation_only.py
 
-But : pour les torrents marqués par un tag (ex: "restore"), restaurer le content_path
-en effectuant uniquement :
-  - setLocation(hash, folder_from_input)
-  - recheck(hash)
+But :
+ - Pour des torrents filtrés par tag (ex: "restore"), changer uniquement le save_path
+   (setLocation -> dossier fourni dans l'input JSON) puis recheck.
+ - Pas de renameFile, pas de changement de category/genre.
+ - DRY_RUN = True par défaut ; --apply désactive et effectue les actions.
+ - Mapping JSON attendu (Radarr-like) : champ lastHash -> mapping entry with "folder" or "importedFilePath".
 
-Aucun renameFile. DRY_RUN = True par défaut (aucune modification).
---apply désactive le dry-run et applique. --yes bypass la confirmation interactive.
+Usage (dry-run):
+  python3 qb_restore_setlocation_only.py -i radarr_history_result.json -t restore
 
-Usage (dry-run) :
-  python3 qb_restore_clean.py -i radarr_history_result.json -t restore
-
-Appliquer réellement :
-  python3 qb_restore_clean.py -i radarr_history_result.json -t restore --apply --yes
+Appliquer réellement:
+  python3 qb_restore_setlocation_only.py -i radarr_history_result.json -t restore --apply --yes
 """
 from __future__ import annotations
 import argparse
@@ -30,7 +29,7 @@ import requests
 # =============================
 # SAFETY SWITCH (DEFAULT)
 # =============================
-DRY_RUN = True  # Par défaut : pas d'action destructive
+DRY_RUN = True  # Par défaut : aucune modification
 
 # =============================
 # DEFAULTS (modifiable via ENV or CLI)
@@ -43,6 +42,7 @@ SLEEP_AFTER_SETLOCATION = 0.2
 SLEEP_AFTER_RECHECK = 0.6
 TIMEOUT = 15.0
 
+OUT_PLAN = Path("qb_restore_plan.json")
 OUT_RESULTS = Path("qb_restore_results_clean.json")
 
 # ---------------- qBittorrent API helpers ----------------
@@ -103,11 +103,6 @@ def parse_tags(tag_str: Optional[str]) -> List[str]:
         return []
     return [t.strip().lower() for t in tag_str.split(",") if t.strip()]
 
-def basename_of_path(p: Optional[str]) -> Optional[str]:
-    if not p:
-        return None
-    return Path(p).name
-
 def dirname_of_path(p: Optional[str]) -> Optional[str]:
     if not p:
         return None
@@ -116,7 +111,7 @@ def dirname_of_path(p: Optional[str]) -> Optional[str]:
 # ---------------- main ----------------
 def main(argv=None):
     global DRY_RUN
-    parser = argparse.ArgumentParser(description="Restore content_path by setLocation(folder) + recheck (no rename).")
+    parser = argparse.ArgumentParser(description="Set save_path (setLocation) from input JSON for torrents filtered by tag, then recheck. No rename.")
     parser.add_argument("-i","--input", type=Path, required=True, help="Radarr-like input JSON")
     parser.add_argument("-t","--tag", required=True, help="qBittorrent tag to filter (ex: restore)")
     parser.add_argument("-c","--category", help="Category filter (optional)")
@@ -128,14 +123,14 @@ def main(argv=None):
     parser.add_argument("--verbose", action="store_true", help="Verbose logs to stderr")
     args = parser.parse_args(argv)
 
-    # toggle DRY_RUN centrally
+    # toggle DRY_RUN from CLI
     if args.apply:
         DRY_RUN = False
 
     if args.verbose:
         print(f"[VERB] DRY_RUN = {DRY_RUN}", file=sys.stderr)
 
-    # load input map
+    # load mapping JSON
     try:
         input_map = load_input_json(args.input)
     except Exception as e:
@@ -144,7 +139,7 @@ def main(argv=None):
     if args.verbose:
         print(f"[VERB] Loaded {len(input_map)} mappings from {args.input}", file=sys.stderr)
 
-    # login qB
+    # login to qBittorrent
     s = requests.Session()
     try:
         qb_login(s, args.host, args.user, args.passw)
@@ -152,14 +147,14 @@ def main(argv=None):
         print(f"[ERROR] qBittorrent login failed: {e}", file=sys.stderr)
         return 2
 
-    # fetch torrents (optionnal category)
+    # fetch torrents (optionally filter by category at API level)
     try:
         all_torrents = qb_get_torrents(s, args.host, category=args.category)
     except Exception as e:
         print(f"[ERROR] Cannot fetch torrents: {e}", file=sys.stderr)
         return 3
 
-    # filter by tag
+    # filter by tag (client-side)
     selected = []
     for t in all_torrents:
         tags = parse_tags(t.get("tags"))
@@ -172,7 +167,7 @@ def main(argv=None):
     if args.verbose:
         print(f"[VERB] Found {len(selected)} torrents with tag '{args.tag}' (category: {args.category})", file=sys.stderr)
 
-    # build actions matching mapping via lastHash
+    # Build actions: match selected torrents with input_map via lastHash
     actions = []
     for t in selected:
         h = (t.get("hash") or "").upper()
@@ -181,8 +176,9 @@ def main(argv=None):
             if args.verbose:
                 print(f"[VERB] No mapping for hash {h} (torrent '{t.get('name')}')", file=sys.stderr)
             continue
+        # target folder: mapping.folder preferred else parent(inportedFilePath)
         target_folder = mapping.get("folder") or dirname_of_path(mapping.get("importedFilePath"))
-        # defensive: if mapping gives file as folder, use parent
+        # defensive: if mapping gives file as folder, convert to parent
         if target_folder and target_folder.lower().endswith(".mkv"):
             target_folder = dirname_of_path(mapping.get("importedFilePath"))
         actions.append({
@@ -202,24 +198,32 @@ def main(argv=None):
             print("[VERB] No mapped actions to perform. Exiting.", file=sys.stderr)
         return 0
 
-    # summary (stderr)
+    # show sample in verbose
     if args.verbose:
         for a in actions[:10]:
             print(f"[VERB]  - {a['name']} | {a['hash']} -> folder: {a['target_folder']}", file=sys.stderr)
         if len(actions) > 10:
             print(f"[VERB] ...and {len(actions)-10} more", file=sys.stderr)
 
-    # If DRY_RUN -> save plan and exit
+    # If DRY_RUN -> write plan and exit
     if DRY_RUN:
-        plan = [{"hash": a["hash"], "name": a["name"], "from": a["save_path"], "to_folder": a["target_folder"], "note": "DRY_RUN"} for a in actions]
-        OUT_RESULTS.write_text(json.dumps({"dry_run": True, "plan": plan}, indent=2, ensure_ascii=False), encoding="utf-8")
+        plan = []
+        for a in actions:
+            plan.append({
+                "hash": a["hash"],
+                "name": a["name"],
+                "from_save_path": a["save_path"],
+                "to_folder": a["target_folder"],
+                "note": "DRY_RUN - no action performed"
+            })
+        OUT_PLAN.write_text(json.dumps({"dry_run": True, "plan": plan}, indent=2, ensure_ascii=False), encoding="utf-8")
         if args.verbose:
-            print(f"[VERB] Dry-run plan written to {OUT_RESULTS}", file=sys.stderr)
+            print(f"[VERB] Dry-run plan written to {OUT_PLAN}", file=sys.stderr)
         else:
-            print(f"[INFO] DRY_RUN plan saved to {OUT_RESULTS}", file=sys.stderr)
+            print(f"[INFO] DRY_RUN plan saved to {OUT_PLAN}", file=sys.stderr)
         return 0
 
-    # If applying, confirm (unless --yes)
+    # If applying, confirm unless --yes
     if not args.yes:
         if not sys.stdin.isatty():
             print("[ERROR] Non-interactive terminal and --apply used without --yes => abort", file=sys.stderr)
@@ -270,7 +274,7 @@ def main(argv=None):
                 print(f"[ERR] recheck failed for {h}: {e}", file=sys.stderr)
             continue
 
-        # small wait, then get state
+        # wait and fetch state after recheck
         time.sleep(SLEEP_AFTER_RECHECK)
         try:
             tinfo = qb_get_torrent_info(s, args.host, h)
@@ -284,7 +288,10 @@ def main(argv=None):
 
     # Save results
     OUT_RESULTS.write_text(json.dumps(results, indent=2, ensure_ascii=False), encoding="utf-8")
-    print(f"[INFO] Apply results saved to {OUT_RESULTS}", file=sys.stderr)
+    if args.verbose:
+        print(f"[VERB] Apply results written to {OUT_RESULTS}", file=sys.stderr)
+    else:
+        print(f"[INFO] Apply results saved to {OUT_RESULTS}", file=sys.stderr)
     return 0
 
 if __name__ == "__main__":
