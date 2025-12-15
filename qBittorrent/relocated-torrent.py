@@ -1,20 +1,23 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-qb_restore_setlocation_only.py
+qb_restore_setlocation_from_radarrlist.py
 
-But :
- - Pour des torrents filtrés par tag (ex: "restore"), changer uniquement le save_path
-   (setLocation -> dossier fourni dans l'input JSON) puis recheck.
- - Pas de renameFile, pas de changement de category/genre.
- - DRY_RUN = True par défaut ; --apply désactive et effectue les actions.
- - Mapping JSON attendu (Radarr-like) : champ lastHash -> mapping entry with "folder" or "importedFilePath".
+Variant of qb_restore_setlocation_only.py that accepts input JSON in two forms:
+ - old Radarr-like mapping: { "<key>": { "lastHash": "...", "folder": "...", ... }, ... }
+ - new list form: [ { "radarr_id": 517, "title": "...", "folder": "...", "mkv_file": "...", "torrent_hash": "..." }, ... ]
+
+Behaviour:
+ - For torrents filtered by tag (ex: "restore"), change only the save_path (setLocation -> folder from input JSON) then recheck.
+ - No rename, no category/genre change.
+ - DRY_RUN = True by default; use --apply to actually perform actions.
+ - The loader will map by torrent hash (uppercase).
 
 Usage (dry-run):
-  python3 qb_restore_setlocation_only.py -i radarr_history_result.json -t restore
+  python3 qb_restore_setlocation_from_radarrlist.py -i radarr_export.json -t restore
 
-Appliquer réellement:
-  python3 qb_restore_setlocation_only.py -i radarr_history_result.json -t restore --apply --yes
+Apply:
+  python3 qb_restore_setlocation_from_radarrlist.py -i radarr_export.json -t restore --apply --yes
 """
 from __future__ import annotations
 import argparse
@@ -87,15 +90,39 @@ def qb_get_torrent_info(s: requests.Session, host: str, hash_: str) -> Optional[
 
 # ---------------- helpers for mapping & selection ----------------
 def load_input_json(p: Path) -> Dict[str, Dict[str,Any]]:
-    """Load radarr-like JSON and return map lastHash->entry (uppercase)."""
+    """
+    Load input JSON and return map hash_upper -> entry.
+
+    Supports two input shapes:
+      - mapping: { "<key>": { "lastHash": "...", "folder": "...", ... }, ... }
+      - list: [ { "torrent_hash": "...", "folder": "...", ... }, ... ]
+    """
     if not p.exists():
         raise FileNotFoundError(f"Input JSON not found: {p}")
     j = json.loads(p.read_text(encoding="utf-8"))
+
     by_hash: Dict[str, Dict[str,Any]] = {}
-    for k, v in j.items():
-        h = (v.get("lastHash") or "").strip().upper()
-        if h:
-            by_hash[h] = v
+
+    if isinstance(j, dict):
+        # old mapping form: iterate values and use lastHash if present
+        for k, v in j.items():
+            if not isinstance(v, dict):
+                continue
+            # check possible fields
+            h = (v.get("lastHash") or v.get("torrent_hash") or v.get("torrentHash") or v.get("hash") or "").strip().upper()
+            if h:
+                by_hash[h] = v
+    elif isinstance(j, list):
+        # new list form: each element should contain torrent_hash or hash
+        for v in j:
+            if not isinstance(v, dict):
+                continue
+            h = (v.get("torrent_hash") or v.get("lastHash") or v.get("hash") or "").strip().upper()
+            if h:
+                by_hash[h] = v
+    else:
+        raise ValueError("Unsupported JSON structure: expected object or list at top level")
+
     return by_hash
 
 def parse_tags(tag_str: Optional[str]) -> List[str]:
@@ -112,7 +139,7 @@ def dirname_of_path(p: Optional[str]) -> Optional[str]:
 def main(argv=None):
     global DRY_RUN
     parser = argparse.ArgumentParser(description="Set save_path (setLocation) from input JSON for torrents filtered by tag, then recheck. No rename.")
-    parser.add_argument("-i","--input", type=Path, required=True, help="Radarr-like input JSON")
+    parser.add_argument("-i","--input", type=Path, required=True, help="Input JSON (list or mapping).")
     parser.add_argument("-t","--tag", required=True, help="qBittorrent tag to filter (ex: restore)")
     parser.add_argument("-c","--category", help="Category filter (optional)")
     parser.add_argument("--host", default=DEFAULT_QBT_HOST, help="qBittorrent host (or set QBT_HOST env)")
@@ -167,20 +194,25 @@ def main(argv=None):
     if args.verbose:
         print(f"[VERB] Found {len(selected)} torrents with tag '{args.tag}' (category: {args.category})", file=sys.stderr)
 
-    # Build actions: match selected torrents with input_map via lastHash
+    # Build actions: match selected torrents with input_map via torrent hash
     actions = []
     for t in selected:
-        h = (t.get("hash") or "").upper()
+        h = (t.get("hash") or "").strip().upper()
+        if not h:
+            if args.verbose:
+                print(f"[VERB] Torrent without hash? skipping: {t.get('name')}", file=sys.stderr)
+            continue
         mapping = input_map.get(h)
         if not mapping:
             if args.verbose:
                 print(f"[VERB] No mapping for hash {h} (torrent '{t.get('name')}')", file=sys.stderr)
             continue
-        # target folder: mapping.folder preferred else parent(inportedFilePath)
-        target_folder = mapping.get("folder") or dirname_of_path(mapping.get("importedFilePath"))
-        # defensive: if mapping gives file as folder, convert to parent
+        # Prefer mapping["folder"], fallback to dirname_of_path on common fields
+        target_folder = mapping.get("folder") or mapping.get("Folder") or dirname_of_path(mapping.get("importedFilePath") or mapping.get("moviefile_path") or mapping.get("movieFile") or mapping.get("mkv_file"))
+        # Defensive: if the mapping field points to a .mkv file, convert to parent folder
         if target_folder and target_folder.lower().endswith(".mkv"):
-            target_folder = dirname_of_path(mapping.get("importedFilePath"))
+            target_folder = dirname_of_path(mapping.get("importedFilePath") or mapping.get("moviefile_path") or mapping.get("mkv_file"))
+
         actions.append({
             "hash": h,
             "name": t.get("name"),
