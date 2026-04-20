@@ -16,6 +16,8 @@ import requests
 import csv
 import json
 from pathlib import Path
+import certifi
+
 
 def bytes_to_human(n):
     # simple human readable
@@ -28,7 +30,13 @@ def bytes_to_human(n):
 def get(api_base, api_key, path, params=None):
     headers = {'X-Api-Key': api_key}
     url = api_base.rstrip('/') + '/api/v3/' + path.lstrip('/')
-    r = requests.get(url, headers=headers, params=params, timeout=30)
+    r = requests.get(
+        url,
+        headers=headers,
+        params=params,
+        timeout=30,
+        verify=certifi.where()
+    )
     r.raise_for_status()
     return r.json()
 
